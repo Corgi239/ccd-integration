@@ -1,0 +1,178 @@
+```{r, echo=F}
+library(ggplot2)
+library(gridExtra)
+library(tidyr)
+library(MASS)
+library(expm)
+library(rsm)
+library(purrr)
+library(mvtnorm)
+source('CCD_point_generation.r')
+```
+
+
+# CCD integration experiment - Bioassay example
+
+## Defining the bioassay data and posterior
+
+```{r}
+df1 <- data.frame(
+  x = c(-0.86, -0.30, -0.05, 0.73),
+  n = c(5, 5, 5, 5),
+  y = c(0, 1, 3, 5)
+)
+
+nParam <- 2
+
+logl <- function(df, a, b)
+  df['y']*(a + b*df['x']) - df['n']*log1p(exp(a + b*df['x']))
+
+logden <- function(theta, df) {
+  -sum(logl(df, theta[1], theta[2]))
+}
+
+logden_partial <- partial(logden, df=df1)
+```
+
+## Full numerical integration
+
+```{r}
+# set reasonable bounds for a and b
+resolution <- 1000
+A = seq(-1.5, 7, length.out = resolution)
+B = seq(-5, 35, length.out = resolution)
+# make vectors that contain all pairwise combinations of A and B -> produce the sampling points
+cA <- rep(A, each = length(B))
+cB <- rep(B, length(A))
+
+# calculate likelihoods at each sampling point: 
+# given a and b, calculate the logl for each of the five observations, sum them, and exponentiate to remove the log
+p <- apply(df1, 1, logl, cA, cB) %>% rowSums() %>% exp()
+
+# resample from the grid using the calculated posterior likelihoods as probability weights
+nsamp <- 1000000
+samp_indices <- base::sample(length(p), size = nsamp,
+                       replace = T, prob = p/sum(p))
+samp_A <- cA[samp_indices[1:nsamp]]
+samp_B <- cB[samp_indices[1:nsamp]]
+# add random jitter, see BDA3 p. 76
+samp_A <- samp_A + runif(nsamp, A[1] - A[2], A[2] - A[1])
+samp_B <- samp_B + runif(nsamp, B[1] - B[2], B[2] - B[1])
+
+# exclude samples with negative b, as LD50 is difficult to interpret in those cases
+bpi <- samp_B > 0.01
+samp_ld50 <- -samp_A[bpi]/samp_B[bpi]
+samp_ld50_mean <- mean(samp_ld50)
+
+xl <- c(-1.5, 5.5)
+yl <- c(-5, 35)
+pos <- ggplot(data = data.frame(cA ,cB, p), aes(x = cA, y = cB)) +
+  geom_raster(aes(fill = p, alpha = p), interpolate = T) +
+  geom_contour(aes(z = p), colour = 'black', size = 0.2, bins=10) +
+  coord_cartesian(xlim = xl, ylim = yl) +
+  labs(x = 'alpha', y = 'beta') +
+  scale_fill_gradient(low = 'yellow', high = 'red', guide = 'none') +
+  scale_alpha(range = c(0, 1), guide='none') +
+  theme_bw() +
+  theme(axis.text=element_text(size=12),
+        axis.title=element_text(size=14))
+
+pos
+# samples <- pos +
+#   geom_point(data = data.frame(samp_A, samp_B), aes(samp_A, samp_B), color = 'steelblue', size = 0.5, alpha=0.7)
+# 
+# samples
+```
+
+## CCD integration
+
+```{r, fig.height=2}
+# perform CCD 
+ccd_unscaled <- CCD(logden_partial, 2, auto.scale = F)
+ccd <- CCD(logden_partial, 2)
+
+# plot the obtained points
+ccd_points <- as.data.frame(ccd$points)
+ccd_unscaled_points <- as.data.frame(ccd_unscaled$points)
+icons <- c(21, rep(21, nParam*2), rep(22, nrow(ccd_points) - nParam*2 - 1))
+theta_plot <- pos + 
+  # geom_point(data=ccd_unscaled_points, aes(x=V1, y=V2), color='lightblue', size=3, pch=icons) +
+  geom_point(data=ccd_points, aes(x=V1, y=V2), color='steelblue', size=2.5, pch=icons, stroke=2) +
+  theme(axis.text=element_text(size=14),
+        axis.title=element_text(size=16))
+
+theta_plot
+```
+
+```{r, fig.height=2, fig.width=2}
+circleFun <- function(center = c(0,0),diameter = 1, npoints = 100){
+    r = diameter / 2
+    tt <- seq(0,2*pi,length.out = npoints)
+    xx <- center[1] + r * cos(tt)
+    yy <- center[2] + r * sin(tt)
+    return(data.frame(x = xx, y = yy))
+}
+circle <- circleFun(c(0,0),2*sqrt(2),npoints = 100)
+
+sq2 <- sqrt(2)
+zX <- c(0, 0, sq2, 0, -sq2, 1, 1, -1, -1)
+zY <- c(0, sq2, 0, -sq2, 0, -1, 1, 1, -1)
+
+z_points <- data.frame('x'=zX, 'y'=zY)
+z_plot <- ggplot() +
+  geom_path(data=circle, aes(x,y), linetype='dashed') +
+  geom_point(data=z_points, aes(x=x, y=y), color='steelblue', size=5, pch=icons, stroke=3) +
+  xlim(c(-1.5, 1.5)) +
+  ylim(c(-1.5, 1.5)) +
+  labs(x = 'z1', y = 'z2') +
+  theme_bw() +
+  theme(aspect.ratio = 1, axis.text=element_text(size=14),
+        axis.title=element_text(size=16))
+
+z_plot
+```
+
+# Evaluation 
+
+```{r}
+hist(samp_ld50, breaks=100)
+max(samp_ld50)
+```
+
+
+```{r}
+bgrzero <- cB > 0.0-1
+grid_ld50 <- -cA / cB
+grid_ld50_mean <- sum(grid_ld50[bgrzero] * p[bgrzero]) / sum(p[bgrzero])
+
+
+ccd_ld50 <- -ccd_points[1] / ccd_points[2]
+ccd_ld50_mean <- weighted.mean(ccd_ld50[,1], ccd$densities * ccd$weights)
+mode_ld50 <- -ccd_points[1,1] / ccd_points[1,2]
+
+sprintf("Mean LD50 obtained with single point estimate: %.4f", mode_ld50)
+sprintf("Mean LD50 obtained with CCD integration: %.4f", ccd_ld50_mean)
+sprintf("Mean LD50 obtained with sampling: %.4f", samp_ld50_mean)
+sprintf("Mean LD50 obtained with grid-based numerical integration: %.4f", grid_ld50_mean)
+```
+
+
+```{r}
+ccd_ld50_sd <-  sqrt(sum((ccd_ld50 - ccd_ld50_mean)**2 * ccd$densities * ccd$weights))
+samp_ld50_sd <- sd(samp_ld50)
+grid_ld50_sd <- sqrt(sum((grid_ld50[bgrzero] - grid_ld50_mean)**2 * p[bgrzero] / sum(p[bgrzero])))
+
+sprintf("Standard deviaiton of LD50 obtained with CCD integration: %.4f", ccd_ld50_sd)
+sprintf("Standard deviaiton of LD50 obtained with sampling: %.4f", samp_ld50_sd)
+sprintf("Standard deviaiton of LD50 obtained with grid-based numerical integration: %.4f", grid_ld50_sd)
+```
+
+```{r}
+ccd_ld50_kurt <- sqrt(sum((ccd_ld50 - ccd_ld50_mean)**4 * ccd$densities * ccd$weights)) / ccd_ld50_sd**4
+samp_ld50_kurt <- moments::kurtosis(samp_ld50)
+grid_ld50_kurt <- sqrt(sum((grid_ld50[bgrzero] - grid_ld50_mean)**4 * p[bgrzero] / sum(p[bgrzero]))) / grid_ld50_sd**4
+
+sprintf("Kurtosis of LD50 obtained with CCD integration: %.4f", ccd_ld50_kurt)
+sprintf("Kurtosis of LD50 obtained with sampling: %.4f", samp_ld50_kurt)
+sprintf("Kurtosis of LD50 obtained with grid-based numerical integration: %.4f", grid_ld50_kurt)
+```

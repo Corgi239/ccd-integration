@@ -1,0 +1,291 @@
+```{r}
+library(ggplot2)
+library(gridExtra)
+library(tidyr)
+library(MASS)
+library(expm)
+library(rsm)
+```
+
+# Define the observed data
+
+```{r}
+df1 <- data.frame(
+  x = c(-0.86, -0.30, -0.05, 0.73),
+  n = c(5, 5, 5, 5),
+  y = c(0, 1, 3, 5)
+)
+```
+
+# Visualize the posterior distribution
+
+```{r}
+# set reasonable bounds for a and b
+A = seq(-1.5, 7, length.out = 100)
+B = seq(-5, 35, length.out = 100)
+# make vectors that contain all pairwise combinations of A and B -> produce the sampling points
+cA <- rep(A, each = length(B))
+cB <- rep(B, length(A))
+# a helper function to calculate the negative log likelihood
+# note: prior here is assumed to be uniform
+logl <- function(df, a, b)
+  df['y']*(a + b*df['x']) - df['n']*log1p(exp(a + b*df['x']))
+
+# calculate likelihoods at each sampling point: 
+# given a and b, calculate the logl for each of the five observations, sum them, and exponentiate to remove the log
+p <- apply(df1, 1, logl, cA, cB) %>% rowSums() %>% exp()
+
+# resample from the grid using the calculated posterior likelihoods as probability weights
+nsamp <- 1000
+samp_indices <- sample(length(p), size = nsamp,
+                       replace = T, prob = p/sum(p))
+samp_A <- cA[samp_indices[1:nsamp]]
+samp_B <- cB[samp_indices[1:nsamp]]
+# add random jitter, see BDA3 p. 76
+samp_A <- samp_A + runif(nsamp, A[1] - A[2], A[2] - A[1])
+samp_B <- samp_B + runif(nsamp, B[1] - B[2], B[2] - B[1])
+
+# exclude samples with negative b, as LD50 is difficult to interpret in those cases
+bpi <- samp_B > 0
+samp_ld50 <- -samp_A[bpi]/samp_B[bpi]
+```
+
+```{r}
+# limits for the plots
+xl <- c(-1.5, 5.5)
+yl <- c(-5, 35)
+pos <- ggplot(data = data.frame(cA ,cB, p), aes(x = cA, y = cB)) +
+  geom_raster(aes(fill = p, alpha = p), interpolate = T) +
+  geom_contour(aes(z = p), colour = 'black', size = 0.2) +
+  coord_cartesian(xlim = xl, ylim = yl) +
+  labs(x = 'theta 1', y = 'theta 2') +
+  scale_fill_gradient(low = 'yellow', high = 'red', guide = F) +
+  scale_alpha(range = c(0, 1), guide='none') +
+  theme_minimal()
+
+sam <- pos +
+  geom_point(data = data.frame(samp_A, samp_B), aes(samp_A, samp_B), color = 'steelblue', size = 0.7, alpha=0.7) +
+  coord_cartesian(xlim = xl, ylim = yl) 
+
+sam
+```
+
+# Determine CCD integration points
+
+## Locate the mode of the distribution and evaluate the Hessian
+
+```{r}
+# here w is simply a pair (a, b)
+reset_logden_counter <- function() {
+  logden.counter <<- 0
+}
+
+logden <- function(w, df) {
+  logden.counter <<- logden.counter + 1
+  -sum(logl(df, w[1], w[2]))
+}
+logden.counter <- 0
+
+w0 <- c(0,0)
+optim_res <- optim(w0, logden, gr = NULL, df1, hessian = T)
+mode <- optim_res$par
+```
+
+```{r}
+nParam <- length(mode)
+f0 <- 1.1
+```
+
+## Compose the whitening transformation
+
+```{r}
+mode_x <- mode[1]
+mode_y <- mode[2]
+H <- optim_res$hessian
+
+# compute the whitening transformation from theta-space to z-space
+eig <- eigen(H)
+Lmbd <- diag(eig$values)
+V <- eig$vectors
+wt <- V %*% sqrtm(Lmbd)
+inv_wt <- solve(wt)
+```
+
+## Generate the star points
+
+```{r}
+# radius of nParam-dimentional sphere
+rad <- sqrt(nParam)
+
+# create star points on the main axes
+star <- array(0, dim=c(nParam*2, nParam))
+for (i in 1:nParam) {
+  star[2*i-1, i] <- rad
+  star[2*i, i] <- -rad
+}
+```
+
+## Generate design points
+```{r}
+# Walsh indices to be included in design points (see Table II in Sanchez and Sanchez (2005))
+walsh <- c(1, 2, 4, 8, 15, 16, 32, 51, 64, 85, 106, 128, 150, 171, 219, 237,
+           247, 256, 279, 297, 455, 512, 537, 557, 597, 643, 803, 863, 898,
+           1024, 1051, 1070, 1112, 1169, 1333, 1345, 1620, 1866, 2048,
+           2076, 2085, 2158, 2372, 2456, 2618, 2800, 2873, 3127, 3284,
+           3483, 3557, 3763, 4096, 4125, 4135, 4176, 4435, 4459, 4469,
+           4497, 4752, 5255, 5732, 5801, 5915, 6100, 6369, 6907, 7069,
+           8192, 8263, 8351, 8422, 8458, 8571, 8750, 8858, 9124, 9314,
+           9500, 10026, 10455, 10556, 11778, 11885, 11984, 13548, 14007,
+           14514, 14965, 15125, 15554, 16384, 16457, 16517, 16609,
+           16771, 16853, 17022, 17453, 17891, 18073, 18562, 18980,
+           19030, 19932, 20075, 20745, 21544, 22633, 23200, 24167,
+           25700, 26360, 26591, 26776, 28443, 28905, 29577, 32705)
+
+# determine the size of the full design matrix
+highest_index <- walsh[nParam] + 1
+folds <- ceiling(log2(highest_index))
+
+# construct the full design matrix 
+H0 = 1
+for (i1 in 1:folds) {
+  H0 <- rbind(cbind(H0, H0), cbind(H0, -H0))
+}
+
+# select points based in Walsh indices
+design <- H0[,1+walsh[1:nParam]]
+```
+
+## Join the star points, design points, and the center point
+
+```{r}
+z_points <- rbind(star, rep(0, nParam), design)
+```
+
+## Shift the points
+
+Adjust the positions of the points along the main axes based on a first-order half-Gaussian approximation.
+
+```{r}
+# matrix to store scaling coefficients for each coordinate of each point
+scaling_coeffs <- array(dim=dim(z_points))
+
+# compute log-density at the mode
+mode_density <- -logden(mode, df1)
+
+# perform shifting for each main direction
+dir <- 1
+for (i in 1:(2*nParam)) {
+  # Find the scaling parameter so that when we move sqrt(2) std
+  # from the mode, the log density drops (approximately) by 1
+  column_ind <- ceiling(i/2)
+  probe_point <- rep(0, nParam)
+  probe_point[column_ind] <- dir
+  probe_density <- -logden(mode + sqrt(2) * probe_point %*% inv_wt, df1)
+  if (mode_density > probe_density) {
+    scale <- sqrt(1/(mode_density - probe_density))
+  } else {
+    scale <- 1
+  }
+  
+  # limit scaling to reasonable values
+  scale <- pmax(pmin(scale, 10), 1/10)
+  
+  # scale coordinates of points in the given direction
+  column <- z_points[, column_ind]
+  scaling_coeffs[(column * dir) >= 0, column_ind] <- scale
+  
+  # flip the direction for next calculation
+  dir <- -dir
+}
+
+# apply the scaling coefficients
+z_points_scaled <- scaling_coeffs * z_points
+```
+
+## Apply the reserve whitening transformation
+
+This returns the obtained points back to the parameter space.
+
+```{r}
+# returning star points to original axes
+# points <- f0 * solve(z) %*% t(star)
+points <- f0 * z_points%*% solve(wt)
+xs <- mode_x +  points[,1]
+ys <- mode_y + points[,2]
+```
+
+```{r}
+points <- data.frame(x=xs, y=ys)
+df <- data.frame(x = c(1, 5), y = c(3, 7))
+pos + 
+  geom_line(data=points[1:2, ], aes(x=x, y=y), color='cadetblue3', linewidth=0.7) +
+  geom_line(data=points[3:4, ], aes(x=x, y=y), color='cadetblue3', linewidth=0.7) +
+  geom_point(data=points[1:9,], aes(x=x, y=y), color='steelblue', size=3) 
+```
+## Compute integration weights
+
+```{r}
+delta_i <- 1 / ((dim(points)[1] - 1) * (f0^2 - 1) * (1+exp(-nParam * f0^2 / 2)))
+delta_0 <- 1
+```
+
+
+# Additional visualizations
+
+```{r}
+dmvnorm <- function(x, mu, sig)
+  exp(-0.5*(length(x)*log(2*pi) + log(det(sig)) + (x-mu)%*%solve(sig, x-mu)))
+
+p <- apply(cbind(cA, cB), 1, dmvnorm, w, S)
+
+# sample from the multivariate normal 
+normsamp <- mvrnorm(nsamp, w, S)
+
+bpi <- normsamp[,2] > 0
+normsamp_ld50 <- -normsamp[bpi,1]/normsamp[bpi,2]
+
+pos_norm <- ggplot(data = data.frame(cA ,cB, p), aes(x = cA, y = cB)) +
+  geom_raster(aes(fill = p, alpha = p), interpolate = T) +
+  geom_contour(aes(z = p), colour = 'black', size = 0.2) +
+  coord_cartesian(xlim = xl, ylim = yl) +
+  labs(x = 'alpha', y = 'beta') +
+  scale_fill_gradient(low = 'yellow', high = 'red', guide = F) +
+  scale_alpha(range = c(0, 1), guide = F) +
+  theme_minimal()
+
+sam_norm <- ggplot(data = data.frame(samp_A=normsamp[,1], samp_B=normsamp[,2])) +
+  geom_point(aes(samp_A, samp_B), color = 'blue', size = 0.3) +
+  coord_cartesian(xlim = xl, ylim = yl) +
+  labs(x = 'alpha', y = 'beta') +
+  theme_minimal()
+
+grid.arrange(pos + geom_point(data=points, aes(x=x, y=y)), pos_norm + geom_point(data=points, aes(x=x, y=y)), nrow=1, widths=c(1,1))
+```
+
+```{r}
+ccd <- CCD_points(logden, df1, 2)
+pointss <- as.data.frame(ccd$points)
+df <- data.frame(x = c(1, 5), y = c(3, 7))
+pos + 
+  geom_point(data=pointss[1:9,], aes(x=V1, y=V2), color='steelblue', size=3) 
+```
+
+```{r}
+ccd_ld50 <- -ccd$points[,1] / ccd$points[,2]
+hist(ccd_ld50)
+```
+```{r}
+hist(samp_ld50, breaks=30)
+```
+
+```{r}
+lds <- ccd$log.densities
+lds - max(lds)
+lds <- lds / sum(lds)
+lds <- exp(lds) * ccd$weights
+
+weighted.mean(ccd_ld50, lds)
+mean(ccd_ld50)
+mean(samp_ld50)
+```
+
