@@ -7,7 +7,7 @@ library(bridgestan)
 # Clone bridgestan repo with
 # `git clone --recurse-submodules https://github.com/roualdes/bridgestan.git` 
 
-# From the bridgestan directory, run 
+# From the CLONED BRIDGESTAN REPOSITORY, run 
 # `make ~/github/ccd-integration/scratch/eight_schools_noncentered_model.so`
 # to generate the .so file
 model <- StanModel$new(
