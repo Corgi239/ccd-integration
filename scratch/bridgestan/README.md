@@ -1,0 +1,1 @@
+You should be able to follow the workflow in `bridgestan.R` to get the log_density/gradients.
