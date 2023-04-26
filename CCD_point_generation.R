@@ -1,20 +1,31 @@
-CCD <- function(logden, nParam, th0='none', f0=1.1, compute.densities=T, auto.scale=T, optim.method='Nelder-Mead') {
+CCD <- function(logden, 
+                nParam, 
+                logden.grad=NULL, 
+                logden.hessian=NULL,
+                mode=NULL, 
+                th0=NULL,
+                f0=1.1,  
+                auto.scale=T, 
+                optim.method='Nelder-Mead') {
   
+  logden.count <- list("function"=0, "gradient"=0)
   
-  ### Define a wrapper to collect information about log-density useage
-  logden.count <- 0
-  logden_wrapper <- function(theta) {
-    logden.count <<- logden.count + 1
-    logden(theta)
+  ### Locate the mode of log-density and evaluate the Hessian
+  if (is.null(mode)) {
+    if (is.null(th0)) {
+      th0 <- rep(0, nParam)
+    }
+    optim_res <- optim(th0, logden, gr = logden.grad, hessian = T, method=optim.method, control=list(fnscale=-1))
+    mode <- optim_res$par
+    H <- -optim_res$hessian
+    logden.count <- optim_res$counts
+  } else {
+    if (is.null(logden.hessian)) {
+      H <- -hessian(logden, mode)
+    } else {
+      H <- -logden.hessian(mode)
+    }
   }
-  
-  ### Locate the mode of log-density
-  if (th0 == 'none') {
-    th0 = rep(0, nParam)
-  }
-  optim_res <- optim(th0, logden_wrapper, gr = NULL, hessian = T, method=optim.method)
-  mode <- optim_res$par
-  H <- optim_res$hessian
   
   ### Compute the whitening transformation from theta-space to z-space
   eig <- eigen(H)
@@ -68,7 +79,7 @@ CCD <- function(logden, nParam, th0='none', f0=1.1, compute.densities=T, auto.sc
   scaling_coeffs <- array(1, dim=dim(z_points))
   
   # compute log-density at the mode
-  mode_density <- -optim_res$value
+  mode_density <- logden(mode)
   
   if (auto.scale) {
     # perform shifting for each main direction
@@ -79,7 +90,8 @@ CCD <- function(logden, nParam, th0='none', f0=1.1, compute.densities=T, auto.sc
       column_ind <- ceiling(i/2)
       probe_point <- rep(0, nParam)
       probe_point[column_ind] <- dir * sqrt(2)
-      probe_density <- -logden_wrapper(mode + probe_point %*% inv_wt)
+      probe_density <- logden(mode + probe_point %*% inv_wt)
+      logden.count[["function"]] <- logden.count[["function"]] + 1
       if (mode_density > probe_density) {
         scale <- sqrt(1/(mode_density - probe_density))
       } else {
@@ -105,21 +117,21 @@ CCD <- function(logden, nParam, th0='none', f0=1.1, compute.densities=T, auto.sc
   points <- f0 * z_points_scaled %*% inv_wt
   points <- points + mode[col(points)]
   
-  ### Calculate integration weights
+  ### Calculate CCD integration weights
   delta_i <- 1 / ((dim(points)[1] - 1) * (f0^2 - 1) * (1+exp(-nParam * f0^2 / 2)))
   delta_0 <- 1
   deltas <- append(c(delta_0), rep(delta_i, point_count - 1))
   
   ### Compute densities at integration points
-  if (compute.densities) {
-    log.densities <- apply(points[-1,], 1, logden_wrapper)
-    log.densities <- append(-mode_density, log.densities)
-    log.densities <- log.densities / sum(log.densities)
-    densities <- exp(log.densities)
-  } else {
-    densities <- rep(na, point_count)
-  }
+  log.densities <- apply(points[-1,], 1, logden)
+  log.densities <- append(mode_density, log.densities)
+  log.densities <- log.densities - max(log.densities)
+  densities <- exp(log.densities)
   
-  out <- list("points"=points, "weights"=deltas, "densities"=densities, "logden.count"=logden.count)
+  ### Finalize the ingratiation weights
+  weights <- deltas * densities
+  weights <- weights / sum(weights)
+  
+  out <- list("points"=points, "weights"=weights, "densities"=densities, "logden.count"=logden.count)
   return(out)
 }

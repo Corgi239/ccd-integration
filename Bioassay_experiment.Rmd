@@ -176,3 +176,8 @@ sprintf("Kurtosis of LD50 obtained with CCD integration: %.4f", ccd_ld50_kurt)
 sprintf("Kurtosis of LD50 obtained with sampling: %.4f", samp_ld50_kurt)
 sprintf("Kurtosis of LD50 obtained with grid-based numerical integration: %.4f", grid_ld50_kurt)
 ```
+
+```{r}
+log(ccd$densities)
+```
+

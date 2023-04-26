@@ -73,4 +73,10 @@ generated quantities {
   // function scaled back to the original scale
   vector[N2] f = gp_pred_rng(x2n, yn, xn, sigma_f, lengthscale_f, sigman, 1e-9)*ysd + ymean;
   real sigma = sigman*ysd;
+  
+  vector[N2] ccd_f = gp_pred_rng(x2n, yn, xn, 1.023144, 0.4122642, 0.4692792, 1e-9)*ysd + ymean;
+  real ccd_sigma = 0.4692792 * ysd;
+  
+  vector[N2] ccd10p_f = gp_pred_rng(x2n, yn, xn, 1.011956	, 0.2794897, 0.2795298	, 1e-9)*ysd + ymean;
+  real ccd10p_sigma = 0.2795298	 * ysd;
 }

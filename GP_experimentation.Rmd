@@ -1,0 +1,464 @@
+CCD integration experiment - Motorcycle study with Gaussian processes
+
+```{r}
+source('CCD_point_generation.r')
+library(expm)
+library(ggplot2)
+library(latex2exp)
+library(tidyverse)
+library(cmdstanr)
+library(posterior)
+theme_set(bayesplot::theme_default(base_family = "sans", base_size=16))
+set1 <- RColorBrewer::brewer.pal(7, "Set1")
+```
+
+# Full data set experiment
+
+## Obtaining the data
+
+```{r}
+library(rjson)
+library(MASS)
+data(mcycle, package="MASS")
+
+# full data set
+standata_gpcovf <- list(x=mcycle$times,
+                        x2=mcycle$times,
+                        y=mcycle$accel,
+                        N=length(mcycle$times),
+                        N2=length(mcycle$times))
+json_file <- toJSON(standata_gpcovf)
+write(json_file, "gpcovf.json")
+```
+
+## MCMC sampling with cmdstanr
+
+```{r}
+model_gpcovf <- cmdstan_model(stan_file = "gpcovf.stan")
+fit_gpcovf <- model_gpcovf$sample(data=standata_gpcovf,
+                                  iter_warmup=500, iter_sampling=1000,
+                                  chains=4, parallel_chains=4, refresh=1000)
+```
+
+```{r}
+draws_gpcovf <- as_draws_rvars(fit_gpcovf$draws())
+summarise_draws(subset(draws_gpcovf,
+                       variable=c('sigma_','lengthscale_','sigma'),
+                       regex=TRUE))
+```
+
+
+## Fitting the model with bridgestan
+
+This model is used only to enable the posterior evaluations needed when running the CCD point generation algorithm.
+
+```{r}
+library(bridgestan)
+model <- StanModel$new("gpcovf_model.so", "gpcovf.json", 1234)
+```
+
+
+```{r}
+print(paste0("This model's name is ", model$name(), "."))
+print(paste0("This model has ", model$param_num(), " parameters."))
+print(paste0("This model has parameters [", toString(model$param_unc_names()), "]."))
+```
+
+## Conducting the CCD point generation
+
+```{r}
+logdensity <- function(theta) {
+  model$log_density(theta, jacobian=TRUE)
+}
+logdensity_gradient <- function(theta) {
+  model$log_density_gradient(theta,  jacobian = TRUE)$gradient
+}
+logdensity_hessian <- function(theta) {
+  model$log_density_hessian(theta,  jacobian = TRUE)$hessian
+}
+
+source('CCD_point_generation.r')
+ccd <- CCD(logdensity,
+           3,
+           th0=c(-1,0,-1),
+           logden.grad=logdensity_gradient,
+           logden.hessian=logdensity_hessian,
+           optim.method='BFGS',
+           auto.scale = T)
+```
+
+## Some visualization for validation
+```{r, fig.width=5}
+xl <- c(0.1,0.65)
+yl <- c(0,3)
+icons <- c(rep(22, 8), rep(21, 7))
+colors <- c(rep('steelblue', 14), 'red')
+
+as.data.frame(exp(ccd$points)) %>% map_df(rev) %>%
+  ggplot(aes(x=V1, y=V2)) +
+    coord_cartesian(xlim = xl, ylim = yl) +
+    labs(x=TeX(r"(lengthscale $l_p$)"), y=TeX(r"($\sigma^2_f$)")) +
+    geom_point(data=as_draws_df(draws_gpcovf), aes(x=lengthscale_f, y=sigma_f), col=alpha('darkgrey', 0.15), pch=19) +
+    geom_point(pch=icons, col=colors, size=2, stroke=1) +
+    theme_bw() 
+    # + theme(axis.title.y = element_text(angle = 0))
+
+xl <- c(0.35,0.65)
+as.data.frame(exp(ccd$points)) %>% map_df(rev) %>%
+  ggplot(aes(x=V3, y=V2)) +
+    coord_cartesian(xlim = xl, ylim = yl) +
+    labs(x=TeX(r"($\sigma_n$)"), y=TeX(r"($\sigma^2_f$)")) +
+    geom_point(data=as_draws_df(draws_gpcovf), aes(x=sigman, y=sigma_f), col=alpha('darkgrey', 0.15), pch=19) +
+    geom_point(pch=icons, col=colors, size=2, stroke=1) +
+    theme_bw()
+
+```
+
+## Optimized model
+
+```{r}
+library(posterior)
+opt_gpcovf <- model_gpcovf$optimize(data=standata_gpcovf,
+                                    init=0.1, algorithm='bfgs')
+odraws_gpcovf <- as_draws_rvars(opt_gpcovf$draws())
+mode <- c(E(odraws_gpcovf$lengthscale_f), E(odraws_gpcovf$sigma_f), E(odraws_gpcovf$sigman))
+subset(odraws_gpcovf, variable=c('sigma_','lengthscale_','sigma'), regex=TRUE)
+
+```
+
+## Predictive plots
+
+### Optimized model
+
+```{r}
+mcycle %>%
+  ggplot(aes(x=times,y=accel))+
+  geom_point()+
+  labs(x="Time (ms)", y="Acceleration (g)", title="")+
+  geom_line(data=mcycle,aes(x=times,y=mean(odraws_gpcovf$f)), color=set1[1])+
+  geom_line(data=mcycle,aes(x=times,y=mean(odraws_gpcovf$f-2*odraws_gpcovf$sigma)), color=set1[1],
+            linetype="dashed")+
+  geom_line(data=mcycle,aes(x=times,y=mean(odraws_gpcovf$f+2*odraws_gpcovf$sigma)), color=set1[1],
+            linetype="dashed")
+```
+
+### CCD-based model
+
+```{r}
+mcycle %>%
+  ggplot(aes(x=times,y=accel))+
+  geom_point()+
+  labs(x="Time (ms)", y="Acceleration (g)", title="")+
+  geom_line(data=mcycle,aes(x=times,y=mean(odraws_gpcovf$ccd_f)), color=set1[1])+
+  geom_line(data=mcycle,aes(x=times,y=mean(odraws_gpcovf$ccd_f-2*odraws_gpcovf$ccd_sigma)), color=set1[1],
+            linetype="dashed")+
+  geom_line(data=mcycle,aes(x=times,y=mean(odraws_gpcovf$ccd_f+2*odraws_gpcovf$ccd_sigma)), color=set1[1],
+            linetype="dashed")
+```
+### MCMC-based model
+
+```{r}
+mcycle %>%
+  mutate(Ef=mean(draws_gpcovf$f),
+         sigma=mean(draws_gpcovf$sigma)) %>%  
+  ggplot(aes(x=times,y=accel))+
+  geom_point()+
+  labs(x="Time (ms)", y="Acceleration (g)")+
+  geom_line(aes(y=Ef), color=set1[1])+
+  geom_line(aes(y=Ef-2*sigma), color=set1[1],linetype="dashed")+
+  geom_line(aes(y=Ef+2*sigma), color=set1[1],linetype="dashed")
+```
+
+
+## Numerical evaluation
+
+```{r}
+map_lengthscale_f_mean <- E(odraws_gpcovf$lengthscale_f)
+map_sigma_f_mean <- E(odraws_gpcovf$sigma_f)
+map_sigman_mean <- E(odraws_gpcovf$sigman)
+map_gradient_evals <- 15
+```
+
+
+```{r}
+ccd_lengthscale_f_mean <- weighted.mean(exp(ccd$points[,1]), ccd$weights)
+ccd_sigma_f_mean <- weighted.mean(exp(ccd$points[,2]), ccd$weights)
+ccd_sigman_mean <- weighted.mean(exp(ccd$points[,3]), ccd$weights)
+ccd_gradient_evals <- sum(ccd$logden.count)
+```
+
+```{r}
+mcmc_lengthscale_f_mean <- E(draws_gpcovf$lengthscale_f)
+mcmc_sigma_f_mean <- E(draws_gpcovf$sigma_f)
+mcmc_sigman_mean <- E(draws_gpcovf$sigman)
+mcmc_gradient_evals <- sum(fit_gpcovf$sampler_diagnostics(format="df")$n_leapfrog__)
+```
+
+```{r}
+results <- data.frame(
+  "strategy" = c("MAP", "CCD", "MCMC"),
+  "E(lengthscale_f)" = c(map_lengthscale_f_mean, ccd_lengthscale_f_mean, mcmc_lengthscale_f_mean),
+  "E(sigma_f)" = c(map_sigma_f_mean, ccd_sigma_f_mean, mcmc_sigma_f_mean),
+  "E(sigman)" = c(map_sigman_mean, ccd_sigman_mean, mcmc_sigman_mean),
+  "gradient_evaluations" <- c(map_gradient_evals, ccd_gradient_evals, mcmc_gradient_evals)
+)
+results
+```
+
+## Convergence visualization
+
+### Establishing the ground truth
+
+```{r}
+# model_gpcovf_large <- cmdstan_model(stan_file = "gpcovf.stan")
+# fit_gpcovf_large <- model_gpcovf_large$sample(data=standata_gpcovf,
+#                                   iter_warmup=500, iter_sampling=100000,
+#                                   chains=4, parallel_chains=4, refresh=5000)
+fit_gpcovf_large <- readRDS("fit_gpcovf_large")
+```
+
+```{r}
+draws_gpcovf_large <- as_draws_rvars(fit_gpcovf_large$draws())
+```
+
+```{r}
+true_lengthscale_f_mean <- E(draws_gpcovf_large$lengthscale_f)
+true_sigma_f_mean <- E(draws_gpcovf_large$sigma_f)
+true_sigman_mean <- E(draws_gpcovf_large$sigman)
+```
+
+### Calculate MAP and CCD errors
+
+```{r}
+map_lengthscale_f_error <- abs(map_lengthscale_f_mean - true_lengthscale_f_mean)
+ccd_lengthscale_f_error <- abs(ccd_lengthscale_f_mean - true_lengthscale_f_mean)
+
+
+```
+
+
+### Convergence visualization
+
+```{r}
+draws_lengthscale_f <- as_draws_df(draws_gpcovf)$lengthscale_f
+mcmc_lengthscale_f_error <- abs(cummean(as_draws_df(draws_gpcovf)$lengthscale_f) - true_lengthscale_f_mean)
+gradient_evals <- cumsum(fit_gpcovf$sampler_diagnostics(format="df")$n_leapfrog__)
+error_data <- data.frame(error=mcmc_lengthscale_f_error, gradient_evals=gradient_evals)
+
+beats <- mcmc_lengthscale_f_error > ccd_lengthscale_f_error
+evals_to_match_ccd <- gradient_evals[max(which(beats))]
+beats <- mcmc_lengthscale_f_error > map_lengthscale_f_error
+evals_to_match_map <- gradient_evals[max(which(beats))]
+annotation_line_type <- 'dotted'
+annotation_line_size <- 0.55
+
+xl <- c(0, tail(gradient_evals, 1)-1000)
+ggplot(error_data, aes(x=gradient_evals, y=error)) +
+  geom_line(size=0.65, col="grey15") +
+  annotate("text", x=tail(gradient_evals, 1) - 1000, y=0.0023, label="MCMC error", col='grey15', fontface='italic') +
+  geom_hline(aes(yintercept=ccd_lengthscale_f_error), linetype=annotation_line_type, col='dodgerblue4', size=annotation_line_size) +
+  annotate("text", x=tail(gradient_evals, 1) - 2000, y=ccd_lengthscale_f_error + 0.001, label="CCD error", col='dodgerblue4', fontface='italic') +
+  geom_vline(aes(xintercept=evals_to_match_ccd), linetype=annotation_line_type, col='dodgerblue4', size=annotation_line_size) +
+  annotate("text", x=evals_to_match_ccd + 900, y=0.022, label=sprintf("%d", evals_to_match_ccd), col='dodgerblue4', fontface='italic') +
+  geom_hline(aes(yintercept=map_lengthscale_f_error), linetype=annotation_line_type, col='lightsteelblue4', size=annotation_line_size) +
+  annotate("text", x=tail(gradient_evals, 1) - 4000, y=map_lengthscale_f_error + 0.001, label="MAP error", col='lightsteelblue4', fontface='italic') +
+  geom_vline(aes(xintercept=evals_to_match_map), linetype=annotation_line_type, col='lightsteelblue4', size=annotation_line_size) +
+  annotate("text", x=evals_to_match_map + 900, y=0.025, label=sprintf("%d", evals_to_match_map), col='lightsteelblue4', fontface='italic') +
+  labs(y=TeX(r"( absolute error in $l_p$ )"), x="posterior gradient evaluations") +
+  theme_bw()
+```
+
+
+# Reduced data set experiment
+
+## Obtaining the data
+
+```{r}
+# reduced data set
+mcycle_10p <- mcycle[seq(1,133,by=10),]
+standata_gpcovf10p <- list(x=mcycle_10p$times,
+                     x2=mcycle$times,
+                     y=mcycle_10p$accel,
+                     N=length(mcycle_10p$times),
+                     N2=length(mcycle$times))
+json_file <- toJSON(standata_gpcovf10p)
+write(json_file, "gpcovf10p.json")
+```
+
+## MCMC sampling 
+
+```{r}
+model_gpcovf10p <- cmdstan_model(stan_file = "gpcovf.stan")
+fit_gpcovf10p <- model_gpcovf10p$sample(data=standata_gpcovf10p,
+                                  iter_warmup=500, iter_sampling=1000,
+                                  chains=4, parallel_chains=4, refresh=1000)
+```
+
+
+```{r}
+draws_gpcovf10p <- as_draws_rvars(fit_gpcovf10p$draws())
+summarise_draws(subset(draws_gpcovf10p,
+                       variable=c('sigma_','lengthscale_','sigma.'),
+                       regex=TRUE))
+```
+
+## Fitting the model with bridgestan
+
+```{r}
+model10p <- StanModel$new("gpcovf_model10p.so", "gpcovf10p.json", 1234)
+```
+
+```{r}
+print(paste0("This model's name is ", model10p$name(), "10p."))
+print(paste0("This model has ", model10p$param_num(), " parameters."))
+print(paste0("This model has parameters [", toString(model10p$param_unc_names()), "]."))
+```
+
+## Conducting the CCD point generation
+
+```{r}
+logdensity10p <- function(theta) {
+  model10p$log_density(theta, jacobian=TRUE)
+}
+logdensity_gradient10p <- function(theta) {
+  model10p$log_density_gradient(theta,  jacobian = TRUE)$gradient
+}
+logdensity_hessian10p <- function(theta) {
+  model10p$log_density_hessian(theta,  jacobian = TRUE)$hessian
+}
+
+source('CCD_point_generation.r')
+ccd10p <- CCD(logdensity10p,
+           3,
+           th0=c(-1,  0, -1),
+           logden.grad=logdensity_gradient10p,
+           logden.hessian=logdensity_hessian10p,
+           optim.method='BFGS',
+           auto.scale = T)
+```
+
+## Some visualizations for validation
+
+```{r}
+xl <- c(-0.1,2)
+yl <- c(-0.3,4)
+icons <- c(rep(22, 8), rep(21, 7))
+colors <- c(rep('steelblue', 14), 'red')
+
+as.data.frame(exp(ccd10p$points)) %>% map_df(rev) %>%
+  ggplot(aes(x=V1, y=V2)) +
+    coord_cartesian(xlim = xl, ylim = yl) +
+    labs(x="lengthscale_f", y="sigma_f") +
+    geom_point(data=as_draws_df(draws_gpcovf10p), aes(x=lengthscale_f, y=sigma_f), col=alpha('darkgrey', 0.1), pch=19) +
+    geom_point(pch=icons, col=colors, size=2, stroke=1) +
+    theme_bw()
+
+xl <- c(-0.25,2)
+as.data.frame(exp(ccd10p$points)) %>% map_df(rev) %>%
+  ggplot(aes(x=V3, y=V2)) +
+    coord_cartesian(xlim = xl, ylim = yl) +
+    labs(x="sigman", y="sigma_f") +
+    geom_point(data=as_draws_df(draws_gpcovf10p), aes(x=sigman, y=sigma_f), col=alpha('darkgrey', 0.15), pch=16) +
+    geom_point(pch=icons, col=colors, size=2, stroke=1) +
+    theme_bw()
+```
+
+## Optimized model
+
+```{r}
+opt_gpcovf10p <- model_gpcovf10p$optimize(data=standata_gpcovf10p,
+                                    init=0.1, algorithm='bfgs')
+odraws_gpcovf10p <- as_draws_rvars(opt_gpcovf10p$draws())
+mode10p <- c(E(odraws_gpcovf10p$lengthscale_f), E(odraws_gpcovf10p$sigma_f), E(odraws_gpcovf10p$sigman))
+subset(odraws_gpcovf10p, variable=c('sigma_','lengthscale_','sigma.'), regex=TRUE)
+```
+
+
+## Predictive plots
+
+### Optimized model
+
+```{r}
+colors <- rep(alpha('black', 0.3), 133)
+colors[seq(1,133,by=10)] <- alpha('blue3', 1)
+
+mcycle %>%
+  ggplot(aes(x=times,y=accel))+
+  geom_point(col=colors)+
+  labs(x="Time (ms)", y="Acceleration (g)", title="")+
+  geom_line(data=mcycle,aes(x=times,y=mean(odraws_gpcovf10p$f)), color=set1[1])+
+  geom_line(data=mcycle,aes(x=times,y=mean(odraws_gpcovf10p$f-2*odraws_gpcovf10p$sigma)), color=set1[1],
+            linetype="dashed")+
+  geom_line(data=mcycle,aes(x=times,y=mean(odraws_gpcovf10p$f+2*odraws_gpcovf10p$sigma)), color=set1[1],
+            linetype="dashed")
+```
+
+### CCD model
+
+```{r}
+mcycle %>%
+  ggplot(aes(x=times,y=accel))+
+  geom_point(col=colors)+
+  labs(x="Time (ms)", y="Acceleration (g)", title="")+
+  geom_line(data=mcycle,aes(x=times,y=mean(odraws_gpcovf10p$ccd10p_f)), color=set1[1])+
+  geom_line(data=mcycle,aes(x=times,y=mean(odraws_gpcovf10p$ccd10p_f-2*odraws_gpcovf10p$ccd10p_sigma)), color=set1[1],
+            linetype="dashed")+
+  geom_line(data=mcycle,aes(x=times,y=mean(odraws_gpcovf10p$ccd10p_f+2*odraws_gpcovf10p$ccd10p_sigma)), color=set1[1],
+            linetype="dashed")
+```
+
+### MCMC-based model
+
+```{r}
+mcycle %>%
+  mutate(Ef=mean(draws_gpcovf10p$f),
+         sigma=mean(draws_gpcovf10p$sigma)) %>%  
+  ggplot(aes(x=times,y=accel))+
+  geom_point(col=colors)+
+  labs(x="Time (ms)", y="Acceleration (g)")+
+  geom_line(aes(y=Ef), color=set1[1])+
+  geom_line(aes(y=Ef-2*sigma), color=set1[1],linetype="dashed")+
+  geom_line(aes(y=Ef+2*sigma), color=set1[1],linetype="dashed")
+```
+
+
+
+## Numerical evaluation
+
+```{r}
+map10p_lengthscale_f_mean <- E(odraws_gpcovf10p$lengthscale_f)
+map10p_sigma_f_mean <- E(odraws_gpcovf10p$sigma_f)
+map10p_sigman_mean <- E(odraws_gpcovf10p$sigman)
+map10p_gradient_evals <- 23
+```
+
+
+```{r}
+ccd10p_lengthscale_f_mean <- weighted.mean(exp(ccd10p$points[,1]), ccd10p$weights)
+ccd10p_sigma_f_mean <- weighted.mean(exp(ccd10p$points[,2]), ccd10p$weights)
+ccd10p_sigman_mean <- weighted.mean(exp(ccd10p$points[,3]), ccd10p$weights)
+ccd10p_gradient_evals <- sum(ccd10p$logden.count)
+```
+
+```{r}
+mcmc10p_lengthscale_f_mean <- E(draws_gpcovf10p$lengthscale_f)
+mcmc10p_sigma_f_mean <- E(draws_gpcovf10p$sigma_f)
+mcmc10p_sigman_mean <- E(draws_gpcovf10p$sigman)
+mcmc10p_gradient_evals <- sum(fit_gpcovf10p$sampler_diagnostics(format="df")$n_leapfrog__)
+```
+
+```{r}
+results10p <- data.frame(
+  "strategy" = c("MAP", "CCD", "MCMC"),
+  "E(lengthscale_f)" = c(map10p_lengthscale_f_mean, ccd10p_lengthscale_f_mean, mcmc10p_lengthscale_f_mean),
+  "E(sigma_f)" = c(map10p_sigma_f_mean, ccd10p_sigma_f_mean, mcmc10p_sigma_f_mean),
+  "E(sigman)" = c(map10p_sigman_mean, ccd10p_sigman_mean, mcmc10p_sigman_mean),
+  "gradient_evaluations" <- c(map10p_gradient_evals, ccd10p_gradient_evals, mcmc10p_gradient_evals)
+)
+results10p
+```
+
+# Extra stuff
+
+## 
+
